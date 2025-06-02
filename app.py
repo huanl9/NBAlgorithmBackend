@@ -6,10 +6,12 @@ import joblib
 import torch
 import torch.nn as nn
 from datetime import datetime
+import sqlite3
+from pathlib import Path
 
 app = Flask(__name__)
-CORS(app, resources={r"/predict": {"origins": "https://your-username.github.io"},
-                     r"/teams": {"origins": "https://your-username.github.io"}})
+CORS(app, resources={r"/predict": {"origins": "https://huanl9.github.io"},
+                     r"/teams": {"origins": "https://huanl9.github.io"}})
 
 # Neural Network definition
 class Net(nn.Module):
@@ -28,110 +30,89 @@ class Net(nn.Module):
         x = self.sigmoid(self.fc3(x))
         return x
 
-# Load and preprocess data
-def load_and_preprocess_data():
-    games = pd.read_csv('./historical-nba-data-and-player-box-scores/versions/166/Games.csv')
-    team_stats = pd.read_csv('./historical-nba-data-and-player-box-scores/versions/166/TeamStatistics.csv')
-    player_stats = pd.read_csv('./historical-nba-data-and-player-box-scores/versions/166/PlayerStatistics.csv', low_memory=False)
+# Database setup
+DB_PATH = Path('nba_data.db')
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def load_data_to_db():
+    # Load only necessary columns
+    games_cols = ['gameId', 'gameDate', 'hometeamId', 'awayteamId', 'hometeamName', 'awayteamName', 'winner']
+    team_stats_cols = ['gameId', 'teamId', 'opponentTeamId', 'gameDate', 'homeOrAway', 'teamScore', 'opponentScore', 'fieldGoalsAttempted', 'reboundsOffensive', 'turnovers', 'freeThrowsAttempted', 'assists', 'reboundsTotal']
+    player_stats_cols = ['gameId', 'playerteamName', 'points']
     
-    games['gameDate'] = pd.to_datetime(games['gameDate'])
-    team_stats['gameDate'] = pd.to_datetime(team_stats['gameDate'])
-    player_stats['gameDate'] = pd.to_datetime(player_stats['gameDate'])
+    games = pd.read_csv('./historical-nba-data-and-player-box-scores/versions/166/Games.csv', usecols=games_cols)
+    team_stats = pd.read_csv('./historical-nba-data-and-player-box-scores/versions/166/TeamStatistics.csv', usecols=team_stats_cols)
+    player_stats = pd.read_csv('./historical-nba-data-and-player-box-scores/versions/166/PlayerStatistics.csv', usecols=player_stats_cols, low_memory=False)
     
-    def get_season(date):
-        year = date.year
-        return year if date.month >= 10 else year - 1
-    games['season'] = games['gameDate'].apply(get_season)
-    team_stats['season'] = team_stats['gameDate'].apply(get_season)
+    games.to_sql('games', conn, if_exists='replace', index=False)
+    team_stats.to_sql('team_stats', conn, if_exists='replace', index=False)
+    player_stats.to_sql('player_stats', conn, if_exists='replace', index=False)
     
-    games = games[games['gameDate'].dt.year >= 2010]
-    team_stats = team_stats[team_stats['gameDate'].dt.year >= 2010]
-    player_stats = player_stats[player_stats['gameId'].isin(games['gameId'])]
-    
-    team_stats = pd.merge(team_stats, games[['gameId', 'hometeamId', 'awayteamId']], on='gameId', how='left')
-    team_stats['homeOrAway'] = np.where(team_stats['teamId'] == team_stats['hometeamId'], 'HOME', 'AWAY')
-    
-    player_stats = pd.merge(player_stats, games[['gameId', 'hometeamName', 'awayteamName', 'hometeamId', 'awayteamId']], on='gameId', how='left')
-    player_stats['teamId'] = np.where(player_stats['playerteamName'] == player_stats['hometeamName'], player_stats['hometeamId'], player_stats['awayteamId'])
-    player_stats = player_stats.dropna(subset=['teamId'])
-    
-    top3_avg_points_df = player_stats.groupby(['gameId', 'teamId']).apply(
+    # Precompute top3_avg_points
+    top3_avg_points = player_stats.groupby(['gameId', 'playerteamName']).apply(
         lambda x: x.nlargest(3, 'points')['points'].mean() if len(x) >= 3 else x['points'].mean(),
         include_groups=False
     ).reset_index(name='top3_avg_points')
-    
-    team_stats = calculate_advanced_stats(team_stats)
-    return games, team_stats, player_stats, top3_avg_points_df
+    top3_avg_points.to_sql('top3_avg_points', conn, if_exists='replace', index=False)
 
-def calculate_advanced_stats(team_stats_df):
-    def calc_poss(row):
-        return row['fieldGoalsAttempted'] - row['reboundsOffensive'] + row['turnovers'] + 0.4 * row['freeThrowsAttempted']
-    team_stats_df['Poss_team'] = team_stats_df.apply(calc_poss, axis=1)
-    game_poss = team_stats_df.groupby('gameId')['Poss_team'].mean().reset_index()
-    game_poss.columns = ['gameId', 'Poss']
-    team_stats_df = pd.merge(team_stats_df, game_poss, on='gameId')
-    team_stats_df['ORtg'] = (team_stats_df['teamScore'] / team_stats_df['Poss']) * 100
-    team_stats_df['DRtg'] = (team_stats_df['opponentScore'] / team_stats_df['Poss']) * 100
-    team_stats_df['Pace'] = team_stats_df['Poss']
-    return team_stats_df
-
-# Feature engineering functions
-def calculate_features(team_id, date, team_stats_df, top3_df, N=5, home_away='HOME'):
-    team_games = team_stats_df[(team_stats_df['teamId'] == team_id) & (team_stats_df['homeOrAway'] == home_away)].sort_values('gameDate', ascending=False).head(N)
-    if team_games.empty:
-        return np.zeros(13)
-    top3_points = top3_df[(top3_df['teamId'] == team_id) & (top3_df['gameId'].isin(team_games['gameId']))]['top3_avg_points'].mean()
-    features = [
-        team_games['teamScore'].mean(),
-        team_games['fieldGoalsMade'].mean(),
-        team_games['fieldGoalsAttempted'].mean(),
-        team_games['threePointsMade'].mean(),
-        team_games['threePointsAttempted'].mean(),
-        team_games['freeThrowsMade'].mean(),
-        team_games['ORtg'].mean(),
-        team_games['DRtg'].mean(),
-        team_games['Pace'].mean(),
-        team_games['reboundsOffensive'].mean(),
-        team_games['reboundsDefensive'].mean(),
-        team_games['assists'].mean(),
-        top3_points if not np.isnan(top3_points) else 0
-    ]
+# Feature engineering functions using database queries
+def calculate_features(team_id, date, home_away='HOME'):
+    query = f"""
+    SELECT ts.teamScore, ts.fieldGoalsMade, ts.fieldGoalsAttempted, ts.threePointsMade, ts.threePointsAttempted,
+           ts.freeThrowsMade, ts.reboundsOffensive, ts.reboundsDefensive, ts.assists, tap.top3_avg_points
+    FROM team_stats ts
+    LEFT JOIN top3_avg_points tap ON ts.gameId = tap.gameId AND ts.teamId = tap.playerteamName
+    WHERE ts.teamId = {team_id} AND ts.homeOrAway = '{home_away}' AND ts.gameDate < '{date}'
+    ORDER BY ts.gameDate DESC
+    LIMIT 5
+    """
+    df = pd.read_sql_query(query, conn)
+    if df.empty:
+        return np.zeros( siano = np.zeros(13))
+    features = df.mean(numeric_only=True).to_list()
     return np.array(features)
 
-def calculate_win_rate(team_id, date, team_stats_df, home_away):
-    team_games = team_stats_df[(team_stats_df['teamId'] == team_id) & (team_stats_df['homeOrAway'] == home_away)]
-    wins = team_games['teamScore'] > team_games['opponentScore']
-    return wins.mean() if not team_games.empty else 0.5
+def calculate_win_rate(team_id, date, home_away):
+    query = f"""
+    SELECT (SUM(CASE WHEN teamScore > opponentScore THEN 1 ELSE 0 END) * 1.0 / COUNT(*)) as win_rate
+    FROM team_stats
+    WHERE teamId = {team_id} AND homeOrAway = '{home_away}' AND gameDate < '{date}'
+    """
+    result = pd.read_sql_query(query, conn)
+    return result['win_rate'].iloc[0] if not result.empty else 0.5
 
-def calculate_current_season_win_rate(team_id, date, season, team_stats_df):
-    team_games = team_stats_df[(team_stats_df['teamId'] == team_id) & (team_stats_df['season'] == season)]
-    wins = team_games['teamScore'] > team_games['opponentScore']
-    return wins.mean() if not team_games.empty else 0.5
+def calculate_current_season_win_rate(team_id, date, season):
+    query = f"""
+    SELECT (SUM(CASE WHEN teamScore > opponentScore THEN 1 ELSE 0 END) * 1.0 / COUNT(*)) as win_rate
+    FROM team_stats
+    WHERE teamId = {team_id} AND season = {season} AND gameDate < '{date}'
+    """
+    result = pd.read_sql_query(query, conn)
+    return result['win_rate'].iloc[0] if not result.empty else 0.5
 
 def get_season(date):
     year = date.year
     return year if date.month >= 10 else year - 1
 
-# Load data and models
-games, team_stats, player_stats, top3_avg_points_df = load_and_preprocess_data()
-team_name_to_id = pd.concat([games[['hometeamId', 'hometeamName']].rename(columns={'hometeamId': 'teamId', 'hometeamName': 'teamName'}),
-                             games[['awayteamId', 'awayteamName']].rename(columns={'awayteamId': 'teamId', 'awayteamName': 'teamName'})]).drop_duplicates().set_index('teamName')['teamId'].to_dict()
-team_names = sorted(set(games['hometeamName'].unique()) | set(games['awayteamName'].unique()))
-
-rf_model = joblib.load('random_forest_model.joblib')
-lr_model = joblib.load('logistic_regression_model.joblib')
-svm_model = joblib.load('svm_model.joblib')
-xgb_model = joblib.load('xgboost_model.joblib')
-voting_model = joblib.load('voting_classifier_model.joblib')
-scaler = joblib.load('scaler.joblib')
-nn_model = Net(input_size=36)
-nn_model.load_state_dict(torch.load('neural_network_model.pth'))
-nn_model.eval()
+# Lazy load models
+def load_models():
+    rf_model = joblib.load('random_forest_model.joblib')
+    lr_model = joblib.load('logistic_regression_model.joblib')
+    svm_model = joblib.load('svm_model.joblib')
+    xgb_model = joblib.load('xgboost_model.joblib')
+    voting_model = joblib.load('voting_classifier_model.joblib')
+    scaler = joblib.load('scaler.joblib')
+    nn_model = Net(input_size=36)
+    nn_model.load_state_dict(torch.load('neural_network_model.pth'))
+    nn_model.eval()
+    return rf_model, lr_model, svm_model, xgb_model, voting_model, scaler, nn_model
 
 # Endpoints
 @app.route('/teams', methods=['GET'])
 def get_teams():
-    return jsonify(team_names)
+    query = "SELECT DISTINCT hometeamName FROM games UNION SELECT DISTINCT awayteamName FROM games"
+    teams = pd.read_sql_query(query, conn)['hometeamName'].tolist()
+    return jsonify(teams)
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -141,37 +122,30 @@ def predict():
     date_str = data['date']
     date = datetime.strptime(date_str, '%Y-%m-%d')
     
-    home_id = team_name_to_id[home_team]
-    away_id = team_name_to_id[away_team]
+    # Get team IDs
+    query_home = f"SELECT hometeamId FROM games WHERE hometeamName = '{home_team}' LIMIT 1"
+    query_away = f"SELECT awayteamId FROM games WHERE awayteamName = '{away_team}' LIMIT 1"
+    home_id = pd.read_sql_query(query_home, conn)['hometeamId'].iloc[0]
+    away_id = pd.read_sql_query(query_away, conn)['awayteamId'].iloc[0]
     
-    past_games = games[games['gameDate'] < date]
-    past_team_stats = team_stats[team_stats['gameDate'] < date]
-    past_player_stats = player_stats[player_stats['gameDate'] < date]
-    past_top3_avg_points_df = top3_avg_points_df[top3_avg_points_df['gameId'].isin(past_games['gameId'])]
-    
-    home_features = calculate_features(home_id, date, past_team_stats, past_top3_avg_points_df, N=5, home_away='HOME')
-    away_features = calculate_features(away_id, date, past_team_stats, past_top3_avg_points_df, N=5, home_away='AWAY')
+    # Calculate features
+    home_features = calculate_features(home_id, date, 'HOME')
+    away_features = calculate_features(away_id, date, 'AWAY')
     
     season = get_season(date)
-    home_win_rate = calculate_win_rate(home_id, date, past_team_stats, 'HOME')
-    away_win_rate = calculate_win_rate(away_id, date, past_team_stats, 'AWAY')
-    home_current_win_rate = calculate_current_season_win_rate(home_id, date, season, past_team_stats)
-    away_current_win_rate = calculate_current_season_win_rate(away_id, date, season, past_team_stats)
-    last_game_home = past_team_stats[past_team_stats['teamId'] == home_id].sort_values('gameDate', ascending=False).head(1)
-    rest_days_home = (date - last_game_home['gameDate'].iloc[0]).days if not last_game_home.empty else 10
-    last_game_away = past_team_stats[past_team_stats['teamId'] == away_id].sort_values('gameDate', ascending=False).head(1)
-    rest_days_away = (date - last_game_away['gameDate'].iloc[0]).days if not last_game_away.empty else 10
-    past_h2h_games = past_games[((past_games['hometeamId'] == home_id) & (past_games['awayteamId'] == away_id)) | 
-                                ((past_games['hometeamId'] == away_id) & (past_games['awayteamId'] == home_id))]
-    h2h_win_rate = (past_h2h_games['winner'] == home_id).mean() if not past_h2h_games.empty else 0.5
-    is_playoff = 0
-    ortg_diff = home_features[6] - away_features[7]
-    drtg_diff = home_features[7] - away_features[6]
+    home_win_rate = calculate_win_rate(home_id, date, 'HOME')
+    away_win_rate = calculate_win_rate(away_id, date, 'AWAY')
+    home_current_win_rate = calculate_current_season_win_rate(home_id, date, season)
+    away_current_win_rate = calculate_current_season_win_rate(away_id, date, season)
     
-    features = np.concatenate([home_features, away_features, [home_win_rate, away_win_rate, home_current_win_rate, away_current_win_rate, rest_days_home, rest_days_away, h2h_win_rate, is_playoff, ortg_diff, drtg_diff]])
+    # Placeholder features (e.g., rest days, H2H win rate)
+    features = np.concatenate([home_features, away_features, [home_win_rate, away_win_rate, home_current_win_rate, away_current_win_rate, 0, 0, 0.5, 0, 0, 0]])
     
     if np.any(np.isnan(features)):
         return jsonify({'error': 'Unable to compute features'}), 400
+    
+    # Load models
+    rf_model, lr_model, svm_model, xgb_model, voting_model, scaler, nn_model = load_models()
     
     scaled_features = scaler.transform([features])
     
@@ -188,4 +162,5 @@ def predict():
     return jsonify({'winner': winner, 'probability': float(average_prob)})
 
 if __name__ == '__main__':
+    load_data_to_db()
     app.run(host='0.0.0.0', port=5000)
